@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use rand::Rng;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -172,7 +173,10 @@ impl GatewayExecutor {
                         buffer.len()
                     ));
 
-                    return Ok(lines);
+                    // Deduplicate results
+                    let unique_lines: Vec<String> = lines.into_iter().collect::<HashSet<_>>().into_iter().collect();
+
+                    return Ok(unique_lines);
                 }
             }
 
@@ -187,12 +191,15 @@ impl GatewayExecutor {
 
         // Timeout: return whatever we have
         let lines: Vec<String> = last_content.lines().map(|s| s.to_string()).collect();
+        // Deduplicate results
+        let unique_lines: Vec<String> = lines.into_iter().collect::<HashSet<_>>().into_iter().collect();
+
         self.dprint(&format!(
             "Timeout reached after {} attempts, returning {} lines",
             max_attempts,
-            lines.len()
+            unique_lines.len()
         ));
-        Ok(lines)
+        Ok(unique_lines)
     }
 
     /// Print verbose/dry-run message
