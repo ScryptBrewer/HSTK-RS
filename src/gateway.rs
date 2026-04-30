@@ -70,14 +70,7 @@ impl GatewayExecutor {
         self.dprint(&format!("Target path exists: {}", fname.exists()));
         self.dprint(&format!("Target path is_dir: {}", fname.is_dir()));
 
-        let full_command = if fname.is_dir() {
-            format!("./{}", command)
-        } else {
-            let name = fname.file_name().ok_or_else(|| anyhow::anyhow!("Cannot get filename from {:?}", fname))?;
-            format!("./{}{}", name.to_string_lossy(), command)
-        };
-
-        self.write_command(&gw_path, &full_command)?;
+        self.write_command(&gw_path, fname, command)?;
 
         self.dprint(&format!("Gateway file exists after write: {}", gw_path.exists()));
 
@@ -90,12 +83,22 @@ impl GatewayExecutor {
     }
 
     /// Write command to gateway file
-    fn write_command(&self, gw_path: &Path, command: &str) -> Result<()> {
+    fn write_command(&self, gw_path: &Path, fname: &Path, command: &str) -> Result<()> {
         self.dprint(&format!("open({:?})", gw_path));
 
         let mut cmd_bytes = Vec::new();
 
-        // Add the command
+        // Prepend path prefix: ./ for directories, ./<filename> for files
+        // This matches the Python implementation's run_cmd behavior
+        if fname.is_dir() {
+            cmd_bytes.extend_from_slice(b"./");
+        } else {
+            cmd_bytes.extend_from_slice(b"./");
+            let name = fname.file_name().ok_or_else(|| anyhow::anyhow!("Cannot get filename from {:?}", fname))?;
+            cmd_bytes.extend_from_slice(name.to_string_lossy().as_bytes());
+        }
+
+        // Add the shadow command
         cmd_bytes.extend_from_slice(command.as_bytes());
 
         // Add Windows padding if needed
