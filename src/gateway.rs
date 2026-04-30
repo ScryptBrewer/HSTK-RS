@@ -78,17 +78,6 @@ impl GatewayExecutor {
 
         let mut cmd_bytes = Vec::new();
 
-        // Add './' prefix if gateway is a directory
-        if gw_path.is_dir() {
-            cmd_bytes.extend_from_slice(b"./");
-        } else {
-            let fname = gw_path
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("Cannot get filename of {:?}", gw_path))?;
-            cmd_bytes.extend_from_slice(b"./");
-            cmd_bytes.extend_from_slice(fname.to_string_lossy().as_bytes());
-        }
-
         // Add the command
         cmd_bytes.extend_from_slice(command.as_bytes());
 
