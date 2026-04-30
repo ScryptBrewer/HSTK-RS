@@ -4,7 +4,6 @@
 
 use anyhow::{Context, Result};
 use rand::Rng;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -71,8 +70,14 @@ impl GatewayExecutor {
         self.dprint(&format!("Target path exists: {}", fname.exists()));
         self.dprint(&format!("Target path is_dir: {}", fname.is_dir()));
 
-        // Write command to gateway
-        self.write_command(&gw_path, command)?;
+        let full_command = if fname.is_dir() {
+            format!("./{}", command)
+        } else {
+            let name = fname.file_name().ok_or_else(|| anyhow::anyhow!("Cannot get filename from {:?}", fname))?;
+            format!("./{}{}", name.to_string_lossy(), command)
+        };
+
+        self.write_command(&gw_path, &full_command)?;
 
         self.dprint(&format!("Gateway file exists after write: {}", gw_path.exists()));
 
@@ -173,10 +178,7 @@ impl GatewayExecutor {
                         buffer.len()
                     ));
 
-                    // Deduplicate results
-                    let unique_lines: Vec<String> = lines.into_iter().collect::<HashSet<_>>().into_iter().collect();
-
-                    return Ok(unique_lines);
+                    return Ok(lines);
                 }
             }
 
@@ -191,15 +193,12 @@ impl GatewayExecutor {
 
         // Timeout: return whatever we have
         let lines: Vec<String> = last_content.lines().map(|s| s.to_string()).collect();
-        // Deduplicate results
-        let unique_lines: Vec<String> = lines.into_iter().collect::<HashSet<_>>().into_iter().collect();
-
         self.dprint(&format!(
             "Timeout reached after {} attempts, returning {} lines",
             max_attempts,
-            unique_lines.len()
+            lines.len()
         ));
-        Ok(unique_lines)
+        Ok(lines)
     }
 
     /// Print verbose/dry-run message
