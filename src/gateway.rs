@@ -7,6 +7,8 @@ use rand::Rng;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 /// Windows padding for gateway writes
 /// Windows doesn't push writes through the stack if there's not enough data
@@ -63,11 +65,20 @@ impl GatewayExecutor {
         let work_id = generate_work_id();
         let gw_path = gateway_path(fname, &work_id)?;
 
+        self.dprint(&format!("Gateway path: {:?}", gw_path));
+        self.dprint(&format!("Command to write: {}", command));
+        self.dprint(&format!("Target path exists: {}", fname.exists()));
+        self.dprint(&format!("Target path is_dir: {}", fname.is_dir()));
+
         // Write command to gateway
         self.write_command(&gw_path, command)?;
 
+        self.dprint(&format!("Gateway file exists after write: {}", gw_path.exists()));
+
         // Read results from gateway
         let results = self.read_results(&gw_path)?;
+
+        self.dprint(&format!("Read {} result lines", results.len()));
 
         Ok(results)
     }
@@ -119,26 +130,64 @@ impl GatewayExecutor {
             return Ok(vec!["dry run output".to_string()]);
         }
 
-        let mut file = File::open(gw_path)
-            .with_context(|| format!("Failed to open gateway file {:?}", gw_path))?;
+        // Poll for results with a timeout
+        let max_attempts = 100; // 10 seconds total
+        let mut last_content = String::new();
+        let mut first_read = true;
 
-        self.dprint("calling read()");
+        for attempt in 0..max_attempts {
+            let mut file = File::open(gw_path)
+                .with_context(|| format!("Failed to open gateway file {:?}", gw_path))?;
 
-        let mut buffer = String::new();
-        file.read_to_string(&mut buffer)
-            .with_context(|| format!("Failed to read from gateway file {:?}", gw_path))?;
+            self.dprint(&format!("calling read() (attempt {})", attempt + 1));
 
-        let lines: Vec<String> = buffer.lines().map(|s| s.to_string()).collect();
+            let mut buffer = String::new();
+            file.read_to_string(&mut buffer)
+                .with_context(|| format!("Failed to read from gateway file {:?}", gw_path))?;
 
+            self.dprint(&format!("close({:?})", gw_path));
+            drop(file);
+
+            self.dprint(&format!(
+                "Read attempt {}: {} bytes, content: {}",
+                attempt + 1,
+                buffer.len(),
+                if buffer.len() > 100 {
+                    format!("{}...", &buffer[..100])
+                } else {
+                    buffer.clone()
+                }
+            ));
+
+            // Check if content has changed (filesystem has processed the command)
+            if !first_read && buffer != last_content {
+                let lines: Vec<String> = buffer.lines().map(|s| s.to_string()).collect();
+
+                self.dprint(&format!(
+                    "Content changed! read() returned {} lines {} bytes",
+                    lines.len(),
+                    buffer.len()
+                ));
+
+                return Ok(lines);
+            }
+
+            last_content = buffer.clone();
+            first_read = false;
+
+            // Wait before next attempt
+            if attempt < max_attempts - 1 {
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        // Timeout: return whatever we have
+        let lines: Vec<String> = last_content.lines().map(|s| s.to_string()).collect();
         self.dprint(&format!(
-            "read() returned {} lines {} bytes",
-            lines.len(),
-            buffer.len()
+            "Timeout reached after {} attempts, returning {} lines",
+            max_attempts,
+            lines.len()
         ));
-
-        self.dprint(&format!("close({:?})", gw_path));
-        drop(file);
-
         Ok(lines)
     }
 
