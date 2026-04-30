@@ -159,17 +159,21 @@ impl GatewayExecutor {
                 }
             ));
 
-            // Check if content has changed (filesystem has processed the command)
-            if !first_read && buffer != last_content {
-                let lines: Vec<String> = buffer.lines().map(|s| s.to_string()).collect();
+            let lines: Vec<String> = buffer.lines().map(|s| s.to_string()).collect();
 
-                self.dprint(&format!(
-                    "Content changed! read() returned {} lines {} bytes",
-                    lines.len(),
-                    buffer.len()
-                ));
+            // Return immediately if we have results
+            // On first read, return if content is non-empty
+            // On subsequent reads, return if content has changed
+            if !buffer.is_empty() {
+                if first_read || buffer != last_content {
+                    self.dprint(&format!(
+                        "Returning {} lines {} bytes",
+                        lines.len(),
+                        buffer.len()
+                    ));
 
-                return Ok(lines);
+                    return Ok(lines);
+                }
             }
 
             last_content = buffer.clone();
