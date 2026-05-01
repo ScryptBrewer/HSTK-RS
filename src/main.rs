@@ -3582,16 +3582,25 @@ fn handle_usage_volume(
         json: globals.output_json,
     };
 
+    // Brace bookkeeping (each block must end at depth 0):
+    //   SUMS_TABLE{                                  depth 1
+    //     |::VALUE={                                 depth 2
+    //       TOP10_TABLE{{space_used,dpath}}          depth 2
+    //     }                                          depth 1
+    //   }                                            depth 0
+    // The previous version was missing the final `}` after each TOP*_TABLE
+    // block, which made the Hammerspace driver respond with err=-7 (parse
+    // failure). The closing-brace runs below are `}}}}` (was `}}}`) at the
+    // end of each VALUE={...TOP*_TABLE{{...}}} group.
     let exp = if top_files {
-        "IS_FILE?ROWS(INSTANCES)?SUMS_TABLE{|::KEY=INSTANCES[ROW].VOLUME,|::VALUE={1FILE,INSTANCES[ROW].SPACE_USED,TOP10_TABLE{{space_used,dpath}}}[ROWS(INSTANCES)]:SUMS_TABLE{|KEY=#EMPTY,|::VALUE={1FILE, SPACE_USED, TOP10_TABLE{{space_used,dpath}}}"
+        "IS_FILE?ROWS(INSTANCES)?SUMS_TABLE{|::KEY=INSTANCES[ROW].VOLUME,|::VALUE={1FILE,INSTANCES[ROW].SPACE_USED,TOP10_TABLE{{space_used,dpath}}}}[ROWS(INSTANCES)]:SUMS_TABLE{|KEY=#EMPTY,|::VALUE={1FILE, SPACE_USED, TOP10_TABLE{{space_used,dpath}}}}"
     } else if deep {
-        "IS_FILE?ROWS(INSTANCES)?SUMS_TABLE{|::KEY=INSTANCES[ROW].VOLUME,|::VALUE={1FILE,INSTANCES[ROW].SPACE_USED,TOP100_TABLE{{space_used,dpath}}}[ROWS(INSTANCES)]:SUMS_TABLE{|KEY=#EMPTY,|::VALUE={1FILE, SPACE_USED, TOP100_TABLE{{space_used,dpath}}}"
+        "IS_FILE?ROWS(INSTANCES)?SUMS_TABLE{|::KEY=INSTANCES[ROW].VOLUME,|::VALUE={1FILE,INSTANCES[ROW].SPACE_USED,TOP100_TABLE{{space_used,dpath}}}}[ROWS(INSTANCES)]:SUMS_TABLE{|KEY=#EMPTY,|::VALUE={1FILE, SPACE_USED, TOP100_TABLE{{space_used,dpath}}}}"
     } else {
         "IS_FILE?ROWS(INSTANCES)?SUMS_TABLE{|::KEY=INSTANCES[ROW].VOLUME,|::VALUE=1}[ROWS(INSTANCES)]:SUMS_TABLE{|KEY=#EMPTY,|::VALUE=1}"
     };
 
     let hsexp = HSExp::new(exp.to_string());
-
     let command = expression::gen_sum(&hsexp, &sum_args)?;
 
     let mut cmd = ShadCmd::new(globals.clone());
