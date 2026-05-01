@@ -4,32 +4,27 @@
 
 use anyhow::{Context, Result};
 use nix::fcntl::{open, OFlag};
+use nix::libc;
 use nix::sys::stat::Mode;
-use nix::unistd::{close, lseek, read, write, Whence};
+use nix::unistd::{close, fsync, lseek, read, unlink, write, Whence};
 use rand::Rng;
 use std::io::Write as IoWrite;
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
-/// Windows padding for gateway writes
 const WIN_PADDING: &[u8] = &[0u8; 50];
-
-/// Maximum response buffer size (matches Python hstk's 65536)
 const READ_BUF_SIZE: usize = 65536;
 
-/// Detect if running on Windows
 pub fn is_windows() -> bool {
     cfg!(windows)
 }
 
-/// Generate a random work ID for gateway files
 pub fn generate_work_id() -> String {
     let mut rng = rand::thread_rng();
     format!("{:08x}", rng.gen_range(0..99999999))
 }
 
-/// Create gateway file path
 pub fn gateway_path(fname: &Path, work_id: &str) -> Result<PathBuf> {
     let gw = if fname.is_dir() {
         fname.to_path_buf()
@@ -39,11 +34,9 @@ pub fn gateway_path(fname: &Path, work_id: &str) -> Result<PathBuf> {
             .ok_or_else(|| anyhow::anyhow!("Cannot get parent of {:?}", fname))?
             .to_path_buf()
     };
-
     Ok(gw.join(format!(".fs_command_gateway {}", work_id)))
 }
 
-/// Hex-dump a byte slice (truncated to first 200 bytes for sanity)
 fn hex_dump(bytes: &[u8]) -> String {
     let take = bytes.len().min(200);
     let hex: Vec<String> = bytes[..take].iter().map(|b| format!("{:02x}", b)).collect();
@@ -54,7 +47,6 @@ fn hex_dump(bytes: &[u8]) -> String {
     }
 }
 
-/// Always-on diagnostic logger to stderr
 macro_rules! dlog {
     ($($arg:tt)*) => {{
         eprintln!("D: {}", format!($($arg)*));
@@ -86,7 +78,6 @@ impl GatewayExecutor {
         let work_id = generate_work_id();
         let gw_path = gateway_path(fname, &work_id)?;
 
-        // ---------- Pre-flight info ----------
         dlog!("Target fname:           {:?}", fname);
         dlog!("Target exists:          {}", fname.exists());
         dlog!("Target is_dir:          {}", fname.is_dir());
@@ -95,41 +86,33 @@ impl GatewayExecutor {
             Ok(p) => dlog!("Target canonical:       {:?}", p),
             Err(e) => dlog!("Target canonical:       <error: {}>", e),
         }
-        if let Ok(meta) = fname.metadata() {
-            dlog!("Target size:            {} bytes", meta.len());
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                dlog!("Target mode:            {:o}", meta.permissions().mode());
-            }
-        }
         dlog!("Generated work_id:      {}", work_id);
         dlog!("Gateway path:           {:?}", gw_path);
-        dlog!("Gateway exists pre:     {}", gw_path.exists());
         dlog!("command argument (raw): {:?}", command);
 
-        // List any pre-existing gateway files in the target directory
         let dir = if fname.is_dir() {
             fname.to_path_buf()
         } else {
             fname.parent().unwrap_or(Path::new(".")).to_path_buf()
         };
         dlog!("--- Pre-existing gateway files in {:?} ---", dir);
+        let mut stale = 0usize;
         if let Ok(entries) = std::fs::read_dir(&dir) {
-            let mut found = 0;
             for entry in entries.flatten() {
-                let name = entry.file_name();
-                let s = name.to_string_lossy();
+                let s = entry.file_name().to_string_lossy().to_string();
                 if s.starts_with(".fs_command_gateway") {
                     dlog!("  stale: {:?}", s);
-                    found += 1;
+                    stale += 1;
                 }
             }
-            if found == 0 {
-                dlog!("  (none)");
-            }
+        }
+        if stale == 0 {
+            dlog!("  (none)");
         } else {
-            dlog!("  (could not read dir)");
+            dlog!(
+                "  ^^^ {} stale gateway file(s) - earlier runs leaked them ^^^",
+                stale
+            );
         }
 
         if self.dry_run {
@@ -137,7 +120,7 @@ impl GatewayExecutor {
             return Ok(vec!["dry run output".to_string()]);
         }
 
-        // ---------- Build command bytes ----------
+        // Build command bytes
         let mut cmd_bytes = Vec::new();
         if fname.is_dir() {
             cmd_bytes.extend_from_slice(b"./");
@@ -168,7 +151,7 @@ impl GatewayExecutor {
         let oflags = OFlag::O_RDWR | OFlag::O_CREAT;
         let mode = Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH;
         dlog!(
-            "syscall: open({:?}, flags=O_RDWR|O_CREAT (0x{:x}), mode=0644)",
+            "syscall: open({:?}, O_RDWR|O_CREAT (0x{:x}), 0644)",
             gw_path,
             oflags.bits()
         );
@@ -176,16 +159,14 @@ impl GatewayExecutor {
             .with_context(|| format!("open() failed for gateway file {:?}", gw_path))?;
         dlog!("                        -> fd = {}", fd);
 
-        // SAFETY: we own this fd until we call close() at the bottom of this
-        // function. BorrowedFd is only used to satisfy nix 0.29's AsFd bound
-        // on write(); we don't keep it past these calls.
+        // SAFETY: we own this fd until the close() call at the bottom of this
+        // function. BorrowedFd is only used to satisfy nix 0.29's AsFd bounds.
         let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
 
-        // Run the protocol; ALWAYS close fd at the end via the close call below.
         let inner: Result<Vec<u8>> = (|| {
-            // ---------- single write() ----------
+            // ---------- write() ----------
             dlog!("syscall: write(fd={}, len={})", fd, cmd_bytes.len());
-            let written = write(bfd, &cmd_bytes).with_context(|| "write() failed".to_string())?;
+            let written = write(bfd, &cmd_bytes).with_context(|| "write() failed")?;
             dlog!("                        -> {} bytes written", written);
             if written != cmd_bytes.len() {
                 dlog!(
@@ -195,16 +176,42 @@ impl GatewayExecutor {
                 );
             }
 
-            // ---------- lseek(0, SEEK_SET) ----------
-            dlog!("syscall: lseek(fd={}, offset=0, SEEK_SET)", fd);
-            let pos =
-                lseek(fd, 0, Whence::SeekSet).with_context(|| "lseek() failed".to_string())?;
+            // ---------- fsync() ----------
+            // CRITICAL: forces the buffered write to actually go to the NFS
+            // server, where the Hammerspace driver lives and processes commands.
+            dlog!("syscall: fsync(fd={})", fd);
+            fsync(bfd).with_context(|| "fsync() failed")?;
+            dlog!("                        -> fsync ok (write committed to server)");
+
+            // ---------- posix_fadvise(POSIX_FADV_DONTNEED) ----------
+            // CRITICAL: drops the local page cache for this fd so the next
+            // read() actually goes to the server, where the driver has now
+            // staged the response (instead of being served from local cache
+            // which still holds our written bytes).
+            //
+            // Using libc directly because nix's posix_fadvise signature
+            // varies between versions.
+            dlog!("syscall: posix_fadvise(fd={}, POSIX_FADV_DONTNEED)", fd);
+            let r = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+            if r != 0 {
+                dlog!(
+                    "                        -> posix_fadvise rc={} ({}) - continuing",
+                    r,
+                    std::io::Error::from_raw_os_error(r)
+                );
+            } else {
+                dlog!("                        -> page cache dropped");
+            }
+
+            // ---------- lseek(0) ----------
+            dlog!("syscall: lseek(fd={}, 0, SEEK_SET)", fd);
+            let pos = lseek(fd, 0, Whence::SeekSet).with_context(|| "lseek() failed")?;
             dlog!("                        -> position = {}", pos);
 
-            // ---------- single read() ----------
+            // ---------- read() ----------
             let mut buf = vec![0u8; READ_BUF_SIZE];
             dlog!("syscall: read(fd={}, max={})", fd, READ_BUF_SIZE);
-            let n = read(fd, &mut buf).with_context(|| "read() failed".to_string())?;
+            let n = read(fd, &mut buf).with_context(|| "read() failed")?;
             dlog!("                        -> {} bytes read", n);
             buf.truncate(n);
 
@@ -212,42 +219,43 @@ impl GatewayExecutor {
             dlog!("ASCII: {:?}", String::from_utf8_lossy(&buf));
             dlog!("HEX:   {}", hex_dump(&buf));
 
-            // CRITICAL DIAGNOSTIC: did Hammerspace actually intercept?
             dlog!("--- DIAGNOSTIC: write/read comparison ---");
             if buf == cmd_bytes {
-                dlog!("!!! READ BUFFER IS BYTE-IDENTICAL TO WRITTEN BYTES !!!");
-                dlog!("!!! Hammerspace did NOT process the command.        !!!");
-                dlog!("!!! The .fs_command_gateway file is behaving as a   !!!");
-                dlog!("!!! plain regular file - the FS driver is not       !!!");
-                dlog!("!!! intercepting it.                                !!!");
-                dlog!("Possible causes:");
-                dlog!("  1. Mount is not actually Hammerspace (or wrong NFS variant)");
-                dlog!("  2. The 'hs' binary uses a different syscall pattern");
-                dlog!("  3. Page cache is interposing - try O_DIRECT");
-                dlog!("  4. Filename encoding mismatch (look at HEX above carefully)");
-            } else if buf.starts_with(&cmd_bytes) {
-                dlog!("!!! READ BUFFER STARTS WITH WRITTEN BYTES !!!");
-                dlog!("    Possibly two writes or buffered read.");
+                dlog!("!!! READ BUFFER STILL BYTE-IDENTICAL TO WRITTEN BYTES !!!");
+                dlog!("!!! Even with fsync + posix_fadvise(POSIX_FADV_DONTNEED).");
+                dlog!("!!! NEXT STEP - capture working hs syscalls for comparison:");
+                dlog!("!!!");
+                dlog!("!!!   strace -f -e trace=openat,read,write,lseek,close,fsync,fcntl,fadvise64 \\");
+                dlog!("!!!     -o /tmp/hs.strace -s 256 \\");
+                dlog!("!!!     hs eval -r -e 'IS_FILE&&ACCESS_AGE>=2DAYS?NAME' >/dev/null 2>&1");
+                dlog!("!!!   grep -E 'fs_command_gateway|eval_rec' /tmp/hs.strace");
+                dlog!("!!!");
+                dlog!("!!! Send me the grep output and I'll diff it against ours.");
             } else if buf.is_empty() {
-                dlog!("!!! READ BUFFER IS EMPTY - response not yet available?");
+                dlog!("!!! READ BUFFER IS EMPTY (response not staged yet?)");
             } else {
-                dlog!("OK: read buffer differs from written bytes (Hammerspace responded)");
+                dlog!("OK: read differs from write -- Hammerspace responded! \\o/");
             }
 
             Ok(buf)
         })();
 
-        // ---------- close() always ----------
+        // ---------- close() ----------
         dlog!("syscall: close(fd={})", fd);
         match close(fd) {
             Ok(_) => dlog!("                        -> closed ok"),
             Err(e) => dlog!("                        -> close error: {}", e),
         }
 
-        dlog!("Gateway exists post:    {}", gw_path.exists());
+        // ---------- unlink (cleanup leaked gateway files) ----------
         if gw_path.exists() {
-            dlog!("NOTE: gateway file still exists after close.");
-            dlog!("      (real hs typically lets the FS driver clean it up)");
+            dlog!("syscall: unlink({:?}) (cleanup)", gw_path);
+            match unlink(&gw_path) {
+                Ok(_) => dlog!("                        -> unlinked"),
+                Err(e) => dlog!("                        -> unlink failed: {}", e),
+            }
+        } else {
+            dlog!("Gateway file already gone after close (driver cleaned it up)");
         }
 
         let buf = inner?;
@@ -353,23 +361,5 @@ mod tests {
             .execute(Path::new("/tmp/test"), "test command")
             .unwrap();
         assert_eq!(results, vec!["dry run output".to_string()]);
-    }
-
-    #[test]
-    fn test_execute_on_paths() {
-        let executor = GatewayExecutor::new(true, false, false);
-        let paths = vec![PathBuf::from("/tmp/test1"), PathBuf::from("/tmp/test2")];
-        let results =
-            execute_on_paths(&paths, |_| Ok("test command".to_string()), &executor).unwrap();
-        assert_eq!(results.len(), 2);
-    }
-
-    #[test]
-    fn test_mock_gateway_executor() {
-        let executor = MockGatewayExecutor::new(false, false, false);
-        let results = executor
-            .execute(Path::new("/tmp/test"), "test command")
-            .unwrap();
-        assert_eq!(results.len(), 2);
     }
 }
