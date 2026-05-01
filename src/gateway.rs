@@ -4,11 +4,9 @@
 
 use anyhow::{Context, Result};
 use rand::Rng;
-use std::fs::File;
-use std::io::{Read, Write};
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::Duration;
 
 /// Windows padding for gateway writes
 /// Windows doesn't push writes through the stack if there's not enough data
@@ -60,7 +58,14 @@ impl GatewayExecutor {
         }
     }
 
-    /// Execute a shadow command on a file
+    /// Execute a shadow command on a file.
+    ///
+    /// CRITICAL: The Hammerspace gateway protocol REQUIRES that the write and
+    /// the read occur on the SAME open file descriptor. The FS driver correlates
+    /// the request and response via the open-file context. If you close the
+    /// file between writing and reading (as the previous implementation did),
+    /// the read returns the literal bytes you wrote rather than the
+    /// hammerscript evaluation result.
     pub fn execute(&self, fname: &Path, command: &str) -> Result<Vec<String>> {
         let work_id = generate_work_id();
         let gw_path = gateway_path(fname, &work_id)?;
@@ -70,53 +75,47 @@ impl GatewayExecutor {
         self.dprint(&format!("Target path exists: {}", fname.exists()));
         self.dprint(&format!("Target path is_dir: {}", fname.is_dir()));
 
-        self.write_command(&gw_path, fname, command)?;
+        if self.dry_run {
+            self.vnprint("  [DRY RUN] gateway operation skipped");
+            return Ok(vec!["dry run output".to_string()]);
+        }
 
-        self.dprint(&format!("Gateway file exists after write: {}", gw_path.exists()));
-
-        // Read results from gateway
-        let results = self.read_results(&gw_path)?;
-
-        self.dprint(&format!("Read {} result lines", results.len()));
-
-        Ok(results)
-    }
-
-    /// Write command to gateway file
-    fn write_command(&self, gw_path: &Path, fname: &Path, command: &str) -> Result<()> {
-        self.dprint(&format!("open({:?})", gw_path));
-
+        // Build command bytes with the path prefix Hammerspace expects:
+        //   ./           for directories
+        //   ./<filename> for files
         let mut cmd_bytes = Vec::new();
-
-        // Prepend path prefix: ./ for directories, ./<filename> for files
-        // This matches the Python implementation's run_cmd behavior
         if fname.is_dir() {
             cmd_bytes.extend_from_slice(b"./");
         } else {
             cmd_bytes.extend_from_slice(b"./");
-            let name = fname.file_name().ok_or_else(|| anyhow::anyhow!("Cannot get filename from {:?}", fname))?;
+            let name = fname
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("Cannot get filename from {:?}", fname))?;
             cmd_bytes.extend_from_slice(name.to_string_lossy().as_bytes());
         }
-
-        // Add the shadow command
         cmd_bytes.extend_from_slice(command.as_bytes());
 
-        // Add Windows padding if needed
+        // Windows doesn't flush small writes through the stack reliably,
+        // so pad to ensure the write is dispatched.
         if is_windows() {
             cmd_bytes.extend_from_slice(WIN_PADDING);
         }
 
+        self.dprint(&format!("open({:?}) [O_RDWR|O_CREAT]", gw_path));
         self.dprint(&format!("write({:?})", String::from_utf8_lossy(&cmd_bytes)));
 
-        if self.dry_run {
-            self.vnprint("  [DRY RUN] gateway write skipped");
-            return Ok(());
-        }
+        // Open ONCE with O_RDWR | O_CREAT. Do NOT close between write and read.
+        // (Avoid O_TRUNC: the file is uniquely named via work_id, so it should
+        // not pre-exist, and we want the create+write+read pattern to mirror
+        // the reference Python implementation as closely as possible.)
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&gw_path)
+            .with_context(|| format!("Failed to open gateway file {:?}", gw_path))?;
 
-        // Open and write to gateway file
-        let mut file = File::create(gw_path)
-            .with_context(|| format!("Failed to create gateway file {:?}", gw_path))?;
-
+        // Push the command into the gateway.
         file.write_all(&cmd_bytes)
             .with_context(|| format!("Failed to write to gateway file {:?}", gw_path))?;
 
@@ -124,83 +123,33 @@ impl GatewayExecutor {
         file.flush()
             .with_context(|| format!("Failed to flush gateway file {:?}", gw_path))?;
 
+        // Rewind so the read returns the response (NOT the bytes we just wrote).
+        self.dprint("seek(0)");
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("Failed to seek gateway file {:?}", gw_path))?;
+
+        // Read the hammerscript evaluation result on the SAME fd.
+        self.dprint("read()");
+        let mut buffer = String::new();
+        file.read_to_string(&mut buffer)
+            .with_context(|| format!("Failed to read from gateway file {:?}", gw_path))?;
+
         self.dprint(&format!("close({:?})", gw_path));
         drop(file);
 
-        Ok(())
-    }
-
-    /// Read results from gateway file
-    fn read_results(&self, gw_path: &Path) -> Result<Vec<String>> {
-        self.dprint(&format!("open({:?})", gw_path));
-
-        if self.dry_run {
-            self.vnprint("  [DRY RUN] gateway read skipped");
-            return Ok(vec!["dry run output".to_string()]);
-        }
-
-        // Poll for results with a timeout
-        let max_attempts = 100; // 10 seconds total
-        let mut last_content = String::new();
-        let mut first_read = true;
-
-        for attempt in 0..max_attempts {
-            let mut file = File::open(gw_path)
-                .with_context(|| format!("Failed to open gateway file {:?}", gw_path))?;
-
-            self.dprint(&format!("calling read() (attempt {})", attempt + 1));
-
-            let mut buffer = String::new();
-            file.read_to_string(&mut buffer)
-                .with_context(|| format!("Failed to read from gateway file {:?}", gw_path))?;
-
-            self.dprint(&format!("close({:?})", gw_path));
-            drop(file);
-
-            self.dprint(&format!(
-                "Read attempt {}: {} bytes, content: {}",
-                attempt + 1,
-                buffer.len(),
-                if buffer.len() > 100 {
-                    format!("{}...", &buffer[..100])
-                } else {
-                    buffer.clone()
-                }
-            ));
-
-            let lines: Vec<String> = buffer.lines().map(|s| s.to_string()).collect();
-
-            // Return immediately if we have results
-            // On first read, return if content is non-empty
-            // On subsequent reads, return if content has changed
-            if !buffer.is_empty() {
-                if first_read || buffer != last_content {
-                    self.dprint(&format!(
-                        "Returning {} lines {} bytes",
-                        lines.len(),
-                        buffer.len()
-                    ));
-
-                    return Ok(lines);
-                }
-            }
-
-            last_content = buffer.clone();
-            first_read = false;
-
-            // Wait before next attempt
-            if attempt < max_attempts - 1 {
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-
-        // Timeout: return whatever we have
-        let lines: Vec<String> = last_content.lines().map(|s| s.to_string()).collect();
         self.dprint(&format!(
-            "Timeout reached after {} attempts, returning {} lines",
-            max_attempts,
-            lines.len()
+            "Read {} bytes: {}",
+            buffer.len(),
+            if buffer.len() > 100 {
+                format!("{}...", &buffer[..100])
+            } else {
+                buffer.clone()
+            }
         ));
+
+        let lines: Vec<String> = buffer.lines().map(|s| s.to_string()).collect();
+        self.dprint(&format!("Returning {} lines", lines.len()));
+
         Ok(lines)
     }
 
@@ -290,8 +239,6 @@ impl MockGatewayExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
 
     #[test]
     fn test_generate_work_id() {
@@ -310,15 +257,12 @@ mod tests {
 
     #[test]
     fn test_gateway_path_dir() {
-        // Note: In actual usage, paths are validated to exist before being passed
+        // In actual usage, paths are validated to exist before being passed.
         // This test uses a path that doesn't exist, so is_dir() returns false
-        // The behavior matches the Python implementation
+        // and the parent is used.
         let fname = PathBuf::from("/tmp/testdir");
         let gw = gateway_path(&fname, "12345678").unwrap();
-        assert_eq!(
-            gw,
-            PathBuf::from("/tmp/.fs_command_gateway 12345678")
-        );
+        assert_eq!(gw, PathBuf::from("/tmp/.fs_command_gateway 12345678"));
     }
 
     #[test]
