@@ -160,11 +160,11 @@ impl GatewayExecutor {
         dlog!("                        -> fd = {}", fd);
 
         // SAFETY: we own this fd until the close() call at the bottom of this
-        // function. BorrowedFd is only used to satisfy nix 0.29's AsFd bounds.
+        // function. BorrowedFd is only used to satisfy nix 0.29's AsFd bound on write().
         let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
 
         let inner: Result<Vec<u8>> = (|| {
-            // ---------- write() ----------
+            // ---------- write() (needs AsFd in nix 0.29) ----------
             dlog!("syscall: write(fd={}, len={})", fd, cmd_bytes.len());
             let written = write(bfd, &cmd_bytes).with_context(|| "write() failed")?;
             dlog!("                        -> {} bytes written", written);
@@ -176,11 +176,11 @@ impl GatewayExecutor {
                 );
             }
 
-            // ---------- fsync() ----------
+            // ---------- fsync() (takes RawFd in nix 0.29) ----------
             // CRITICAL: forces the buffered write to actually go to the NFS
             // server, where the Hammerspace driver lives and processes commands.
             dlog!("syscall: fsync(fd={})", fd);
-            fsync(bfd).with_context(|| "fsync() failed")?;
+            fsync(fd).with_context(|| "fsync() failed")?;
             dlog!("                        -> fsync ok (write committed to server)");
 
             // ---------- posix_fadvise(POSIX_FADV_DONTNEED) ----------
@@ -188,9 +188,6 @@ impl GatewayExecutor {
             // read() actually goes to the server, where the driver has now
             // staged the response (instead of being served from local cache
             // which still holds our written bytes).
-            //
-            // Using libc directly because nix's posix_fadvise signature
-            // varies between versions.
             dlog!("syscall: posix_fadvise(fd={}, POSIX_FADV_DONTNEED)", fd);
             let r = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
             if r != 0 {
@@ -234,7 +231,7 @@ impl GatewayExecutor {
             } else if buf.is_empty() {
                 dlog!("!!! READ BUFFER IS EMPTY (response not staged yet?)");
             } else {
-                dlog!("OK: read differs from write -- Hammerspace responded! \\o/");
+                dlog!("OK: read differs from write -- Hammerspace responded!");
             }
 
             Ok(buf)
