@@ -1,82 +1,23 @@
-// src/gateway.rs
-// Shadow command gateway system for Hammerspace CLI
-// DIAGNOSTIC BUILD - uses raw POSIX syscalls via nix, with heavy debug to stderr
-
+// ============================================================
+// REPLACE the imports at the top of src/gateway.rs with these:
+// ============================================================
 use anyhow::{Context, Result};
 use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
 use nix::unistd::{close, lseek, read, write, Whence};
 use rand::Rng;
 use std::io::Write as IoWrite;
+use std::os::fd::BorrowedFd;            // <-- NEW
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
-/// Windows padding for gateway writes
-const WIN_PADDING: &[u8] = &[0u8; 50];
-
-/// Maximum response buffer size (matches Python hstk's 65536)
-const READ_BUF_SIZE: usize = 65536;
-
-/// Detect if running on Windows
-pub fn is_windows() -> bool {
-    cfg!(windows)
-}
-
-/// Generate a random work ID for gateway files
-pub fn generate_work_id() -> String {
-    let mut rng = rand::thread_rng();
-    format!("{:08x}", rng.gen_range(0..99999999))
-}
-
-/// Create gateway file path
-pub fn gateway_path(fname: &Path, work_id: &str) -> Result<PathBuf> {
-    let gw = if fname.is_dir() {
-        fname.to_path_buf()
-    } else {
-        fname
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Cannot get parent of {:?}", fname))?
-            .to_path_buf()
-    };
-
-    Ok(gw.join(format!(".fs_command_gateway {}", work_id)))
-}
-
-/// Hex-dump a byte slice (truncated to first 200 bytes for sanity)
-fn hex_dump(bytes: &[u8]) -> String {
-    let take = bytes.len().min(200);
-    let hex: Vec<String> = bytes[..take].iter().map(|b| format!("{:02x}", b)).collect();
-    if bytes.len() > take {
-        format!("{} ... ({} more bytes)", hex.join(" "), bytes.len() - take)
-    } else {
-        hex.join(" ")
-    }
-}
-
-/// Always-on diagnostic logger to stderr
-macro_rules! dlog {
-    ($($arg:tt)*) => {{
-        eprintln!("D: {}", format!($($arg)*));
-        let _ = std::io::stderr().flush();
-    }};
-}
-
-#[derive(Debug, Clone)]
-pub struct GatewayExecutor {
-    pub dry_run: bool,
-    pub verbose: bool,
-    pub debug: bool,
-}
-
-impl GatewayExecutor {
-    pub fn new(dry_run: bool, verbose: bool, debug: bool) -> Self {
-        Self {
-            dry_run,
-            verbose,
-            debug,
-        }
-    }
-
+// ============================================================
+// REPLACE the entire execute() method body with this version.
+// Only the open/write section is materially different - we wrap
+// the RawFd in a BorrowedFd so it satisfies nix 0.29's AsFd bound
+// on write(). lseek/read/close still take RawFd in 0.29, so those
+// stay as-is.
+// ============================================================
     pub fn execute(&self, fname: &Path, command: &str) -> Result<Vec<String>> {
         dlog!("============================================================");
         dlog!("GatewayExecutor::execute() called");
@@ -172,11 +113,15 @@ impl GatewayExecutor {
             .with_context(|| format!("open() failed for gateway file {:?}", gw_path))?;
         dlog!("                        -> fd = {}", fd);
 
-        // Run the protocol; ALWAYS close fd at the end via the close call below.
+        // SAFETY: we own this fd until we call close() at the bottom of this
+        // function. BorrowedFd is only used to satisfy nix 0.29's AsFd bound
+        // on write(); we don't keep it past these calls.
+        let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+
         let inner: Result<Vec<u8>> = (|| {
             // ---------- single write() ----------
             dlog!("syscall: write(fd={}, len={})", fd, cmd_bytes.len());
-            let written = write(fd, &cmd_bytes).with_context(|| "write() failed".to_string())?;
+            let written = write(bfd, &cmd_bytes).with_context(|| "write() failed".to_string())?;
             dlog!("                        -> {} bytes written", written);
             if written != cmd_bytes.len() {
                 dlog!(
@@ -249,93 +194,3 @@ impl GatewayExecutor {
 
         Ok(lines)
     }
-
-    fn vnprint(&self, line: &str) {
-        if self.verbose || self.dry_run {
-            let tag = if self.dry_run { "N: " } else { "V: " };
-            println!("{}{}", tag, line);
-        }
-    }
-
-    #[allow(dead_code)]
-    fn dprint(&self, line: &str) {
-        if self.debug {
-            println!("D: {}", line);
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub fn execute_on_paths(
-    paths: &[PathBuf],
-    command_generator: impl Fn(&Path) -> Result<String>,
-    executor: &GatewayExecutor,
-) -> Result<Vec<(PathBuf, Vec<String>)>> {
-    let mut results = Vec::new();
-    for path in paths {
-        let command = command_generator(path)?;
-        let output = executor.execute(path, &command)?;
-        results.push((path.clone(), output));
-    }
-    Ok(results)
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct MockGatewayExecutor {
-    pub dry_run: bool,
-    pub verbose: bool,
-    pub debug: bool,
-    pub mock_output: Vec<String>,
-}
-
-#[allow(dead_code)]
-impl MockGatewayExecutor {
-    pub fn new(dry_run: bool, verbose: bool, debug: bool) -> Self {
-        Self {
-            dry_run,
-            verbose,
-            debug,
-            mock_output: vec![
-                "mock result line 1".to_string(),
-                "mock result line 2".to_string(),
-            ],
-        }
-    }
-
-    pub fn execute(&self, _fname: &Path, _command: &str) -> Result<Vec<String>> {
-        if self.dry_run {
-            return Ok(vec!["dry run output".to_string()]);
-        }
-        Ok(self.mock_output.clone())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_generate_work_id() {
-        let id1 = generate_work_id();
-        let id2 = generate_work_id();
-        assert_ne!(id1, id2);
-        assert_eq!(id1.len(), 8);
-    }
-
-    #[test]
-    fn test_gateway_path_file() {
-        let fname = PathBuf::from("/tmp/test.txt");
-        let gw = gateway_path(&fname, "12345678").unwrap();
-        assert_eq!(gw, PathBuf::from("/tmp/.fs_command_gateway 12345678"));
-    }
-
-    #[test]
-    fn test_gateway_executor_dry_run() {
-        let executor = GatewayExecutor::new(true, false, false);
-        let results = executor
-            .execute(Path::new("/tmp/test"), "test command")
-            .unwrap();
-        assert_eq!(results, vec!["dry run output".to_string()]);
-    }
-}
