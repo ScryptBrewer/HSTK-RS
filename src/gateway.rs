@@ -1,12 +1,27 @@
 // src/gateway.rs
 // Shadow command gateway system for Hammerspace CLI
-// DIAGNOSTIC BUILD - uses raw POSIX syscalls via nix, with heavy debug to stderr
+//
+// Protocol (verified via strace of the official `hs` binary on a Hammerspace
+// NFS4.2 mount, 2026-05-01):
+//
+//   1. openat(".fs_command_gateway 0xXXXXXXX",
+//             O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666)   -> wfd
+//   2. write(wfd, "./PREFIX COMMAND")
+//   3. close(wfd)                  <-- forces NFS commit (close-to-open)
+//   4. openat(same path, O_RDONLY|O_CLOEXEC)              -> rfd
+//   5. read(rfd, response)         <-- fresh fd = no stale page cache
+//   6. close(rfd)
+//
+// The two-open / close-between dance is ESSENTIAL. With a single O_RDWR fd
+// the write data stays in the local NFS page cache and the read is served
+// from cache - the Hammerspace driver on the SERVER never sees the request.
+// Adding fsync()/posix_fadvise(POSIX_FADV_DONTNEED) is NOT sufficient; only
+// close()-then-open() triggers proper NFS close-to-open cache semantics.
 
 use anyhow::{Context, Result};
 use nix::fcntl::{open, OFlag};
-use nix::libc;
 use nix::sys::stat::Mode;
-use nix::unistd::{close, fsync, lseek, read, unlink, write, Whence};
+use nix::unistd::{close, read, unlink, write};
 use rand::Rng;
 use std::io::Write as IoWrite;
 use std::os::fd::BorrowedFd;
@@ -20,9 +35,10 @@ pub fn is_windows() -> bool {
     cfg!(windows)
 }
 
+/// Generate a work ID matching `hs`'s `0x` + 7-hex-digits format.
 pub fn generate_work_id() -> String {
     let mut rng = rand::thread_rng();
-    format!("{:08x}", rng.gen_range(0..99999999))
+    format!("0x{:07x}", rng.gen_range(0..0x1000_0000u32))
 }
 
 pub fn gateway_path(fname: &Path, work_id: &str) -> Result<PathBuf> {
@@ -72,144 +88,110 @@ impl GatewayExecutor {
 
     pub fn execute(&self, fname: &Path, command: &str) -> Result<Vec<String>> {
         dlog!("============================================================");
-        dlog!("GatewayExecutor::execute() called");
+        dlog!("GatewayExecutor::execute()  (two-open close-to-open protocol)");
         dlog!("============================================================");
 
         let work_id = generate_work_id();
         let gw_path = gateway_path(fname, &work_id)?;
 
         dlog!("Target fname:           {:?}", fname);
-        dlog!("Target exists:          {}", fname.exists());
-        dlog!("Target is_dir:          {}", fname.is_dir());
-        dlog!("Target is_file:         {}", fname.is_file());
-        match fname.canonicalize() {
-            Ok(p) => dlog!("Target canonical:       {:?}", p),
-            Err(e) => dlog!("Target canonical:       <error: {}>", e),
-        }
         dlog!("Generated work_id:      {}", work_id);
         dlog!("Gateway path:           {:?}", gw_path);
         dlog!("command argument (raw): {:?}", command);
-
-        let dir = if fname.is_dir() {
-            fname.to_path_buf()
-        } else {
-            fname.parent().unwrap_or(Path::new(".")).to_path_buf()
-        };
-        dlog!("--- Pre-existing gateway files in {:?} ---", dir);
-        let mut stale = 0usize;
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let s = entry.file_name().to_string_lossy().to_string();
-                if s.starts_with(".fs_command_gateway") {
-                    dlog!("  stale: {:?}", s);
-                    stale += 1;
-                }
-            }
-        }
-        if stale == 0 {
-            dlog!("  (none)");
-        } else {
-            dlog!(
-                "  ^^^ {} stale gateway file(s) - earlier runs leaked them ^^^",
-                stale
-            );
-        }
 
         if self.dry_run {
             self.vnprint("  [DRY RUN] gateway operation skipped");
             return Ok(vec!["dry run output".to_string()]);
         }
 
-        // Build command bytes
+        // ---------- Build command bytes ----------
         let mut cmd_bytes = Vec::new();
         if fname.is_dir() {
             cmd_bytes.extend_from_slice(b"./");
-            dlog!("Path prefix:            ./   (directory)");
         } else {
             cmd_bytes.extend_from_slice(b"./");
             let name = fname
                 .file_name()
                 .ok_or_else(|| anyhow::anyhow!("Cannot get filename from {:?}", fname))?;
             cmd_bytes.extend_from_slice(name.to_string_lossy().as_bytes());
-            dlog!(
-                "Path prefix:            ./{}  (file)",
-                name.to_string_lossy()
-            );
         }
         cmd_bytes.extend_from_slice(command.as_bytes());
-
         if is_windows() {
             cmd_bytes.extend_from_slice(WIN_PADDING);
-            dlog!("Windows padding:        +{} bytes", WIN_PADDING.len());
         }
 
         dlog!("--- cmd_bytes to write ({} bytes) ---", cmd_bytes.len());
         dlog!("ASCII: {:?}", String::from_utf8_lossy(&cmd_bytes));
         dlog!("HEX:   {}", hex_dump(&cmd_bytes));
 
-        // ---------- open(O_RDWR | O_CREAT, 0644) ----------
-        let oflags = OFlag::O_RDWR | OFlag::O_CREAT;
-        let mode = Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH;
+        // ============================================================
+        // PHASE 1: WRITE
+        //   open(O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666)
+        //   write
+        //   close          <- forces NFS to flush our write to the server
+        // ============================================================
+        let write_flags =
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_CLOEXEC;
+        // 0666 (matches hs)
+        let mode = Mode::S_IRUSR
+            | Mode::S_IWUSR
+            | Mode::S_IRGRP
+            | Mode::S_IWGRP
+            | Mode::S_IROTH
+            | Mode::S_IWOTH;
+
         dlog!(
-            "syscall: open({:?}, O_RDWR|O_CREAT (0x{:x}), 0644)",
-            gw_path,
-            oflags.bits()
+            "PHASE 1 syscall: open({:?}, O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666)",
+            gw_path
         );
-        let fd: RawFd = open(&gw_path, oflags, mode)
-            .with_context(|| format!("open() failed for gateway file {:?}", gw_path))?;
-        dlog!("                        -> fd = {}", fd);
+        let wfd: RawFd = open(&gw_path, write_flags, mode)
+            .with_context(|| format!("write-phase open() failed for {:?}", gw_path))?;
+        dlog!("                         -> wfd = {}", wfd);
 
-        // SAFETY: we own this fd until the close() call at the bottom of this
-        // function. BorrowedFd is only used to satisfy nix 0.29's AsFd bound on write().
-        let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+        // SAFETY: we own wfd until the close() call below.
+        let bwfd = unsafe { BorrowedFd::borrow_raw(wfd) };
 
-        let inner: Result<Vec<u8>> = (|| {
-            // ---------- write() (needs AsFd in nix 0.29) ----------
-            dlog!("syscall: write(fd={}, len={})", fd, cmd_bytes.len());
-            let written = write(bfd, &cmd_bytes).with_context(|| "write() failed")?;
-            dlog!("                        -> {} bytes written", written);
-            if written != cmd_bytes.len() {
-                dlog!(
-                    "  WARNING: short write! expected {}, got {}",
-                    cmd_bytes.len(),
-                    written
-                );
+        let write_outcome: Result<()> = (|| {
+            dlog!("syscall: write(wfd={}, len={})", wfd, cmd_bytes.len());
+            let n = write(bwfd, &cmd_bytes).with_context(|| "write() failed")?;
+            dlog!("                         -> {} bytes written", n);
+            if n != cmd_bytes.len() {
+                anyhow::bail!("short write: {} of {}", n, cmd_bytes.len());
             }
+            Ok(())
+        })();
 
-            // ---------- fsync() (takes RawFd in nix 0.29) ----------
-            // CRITICAL: forces the buffered write to actually go to the NFS
-            // server, where the Hammerspace driver lives and processes commands.
-            dlog!("syscall: fsync(fd={})", fd);
-            fsync(fd).with_context(|| "fsync() failed")?;
-            dlog!("                        -> fsync ok (write committed to server)");
+        // CRITICAL: close the write fd BEFORE opening for read. This is what
+        // triggers NFS close-to-open consistency - the kernel flushes our
+        // write to the server, where the Hammerspace driver intercepts it
+        // and stages a response in place of the file's contents.
+        dlog!("syscall: close(wfd={})  <-- forces NFS commit to server", wfd);
+        match close(wfd) {
+            Ok(_) => dlog!("                         -> closed ok"),
+            Err(e) => dlog!("                         -> close error: {}", e),
+        }
+        write_outcome?;
 
-            // ---------- posix_fadvise(POSIX_FADV_DONTNEED) ----------
-            // CRITICAL: drops the local page cache for this fd so the next
-            // read() actually goes to the server, where the driver has now
-            // staged the response (instead of being served from local cache
-            // which still holds our written bytes).
-            dlog!("syscall: posix_fadvise(fd={}, POSIX_FADV_DONTNEED)", fd);
-            let r = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
-            if r != 0 {
-                dlog!(
-                    "                        -> posix_fadvise rc={} ({}) - continuing",
-                    r,
-                    std::io::Error::from_raw_os_error(r)
-                );
-            } else {
-                dlog!("                        -> page cache dropped");
-            }
+        // ============================================================
+        // PHASE 2: READ
+        //   open(O_RDONLY|O_CLOEXEC)   <- fresh fd, no stale page cache
+        //   read
+        //   close
+        // ============================================================
+        let read_flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC;
+        dlog!(
+            "PHASE 2 syscall: open({:?}, O_RDONLY|O_CLOEXEC)",
+            gw_path
+        );
+        let rfd: RawFd = open(&gw_path, read_flags, Mode::empty())
+            .with_context(|| format!("read-phase open() failed for {:?}", gw_path))?;
+        dlog!("                         -> rfd = {}", rfd);
 
-            // ---------- lseek(0) ----------
-            dlog!("syscall: lseek(fd={}, 0, SEEK_SET)", fd);
-            let pos = lseek(fd, 0, Whence::SeekSet).with_context(|| "lseek() failed")?;
-            dlog!("                        -> position = {}", pos);
-
-            // ---------- read() ----------
+        let read_outcome: Result<Vec<u8>> = (|| {
             let mut buf = vec![0u8; READ_BUF_SIZE];
-            dlog!("syscall: read(fd={}, max={})", fd, READ_BUF_SIZE);
-            let n = read(fd, &mut buf).with_context(|| "read() failed")?;
-            dlog!("                        -> {} bytes read", n);
+            dlog!("syscall: read(rfd={}, max={})", rfd, READ_BUF_SIZE);
+            let n = read(rfd, &mut buf).with_context(|| "read() failed")?;
+            dlog!("                         -> {} bytes read", n);
             buf.truncate(n);
 
             dlog!("--- response ({} bytes) ---", buf.len());
@@ -218,44 +200,33 @@ impl GatewayExecutor {
 
             dlog!("--- DIAGNOSTIC: write/read comparison ---");
             if buf == cmd_bytes {
-                dlog!("!!! READ BUFFER STILL BYTE-IDENTICAL TO WRITTEN BYTES !!!");
-                dlog!("!!! Even with fsync + posix_fadvise(POSIX_FADV_DONTNEED).");
-                dlog!("!!! NEXT STEP - capture working hs syscalls for comparison:");
-                dlog!("!!!");
-                dlog!("!!!   strace -f -e trace=openat,read,write,lseek,close,fsync,fcntl,fadvise64 \\");
-                dlog!("!!!     -o /tmp/hs.strace -s 256 \\");
-                dlog!("!!!     hs eval -r -e 'IS_FILE&&ACCESS_AGE>=2DAYS?NAME' >/dev/null 2>&1");
-                dlog!("!!!   grep -E 'fs_command_gateway|eval_rec' /tmp/hs.strace");
-                dlog!("!!!");
-                dlog!("!!! Send me the grep output and I'll diff it against ours.");
+                dlog!("!!! READ STILL == WRITE  (driver did not intercept)");
             } else if buf.is_empty() {
-                dlog!("!!! READ BUFFER IS EMPTY (response not staged yet?)");
+                dlog!("!!! READ IS EMPTY (no response staged)");
             } else {
-                dlog!("OK: read differs from write -- Hammerspace responded!");
+                dlog!("OK: Hammerspace responded with real data!");
             }
-
             Ok(buf)
         })();
 
-        // ---------- close() ----------
-        dlog!("syscall: close(fd={})", fd);
-        match close(fd) {
-            Ok(_) => dlog!("                        -> closed ok"),
-            Err(e) => dlog!("                        -> close error: {}", e),
+        dlog!("syscall: close(rfd={})", rfd);
+        match close(rfd) {
+            Ok(_) => dlog!("                         -> closed ok"),
+            Err(e) => dlog!("                         -> close error: {}", e),
         }
 
-        // ---------- unlink (cleanup leaked gateway files) ----------
+        // Cleanup: on Hammerspace, the driver typically leaves the gateway
+        // file in place after a successful query (we observed this in the
+        // strace - hs doesn't unlink either). Try to clean it up anyway so
+        // we don't leak files; ignore any error.
         if gw_path.exists() {
-            dlog!("syscall: unlink({:?}) (cleanup)", gw_path);
             match unlink(&gw_path) {
-                Ok(_) => dlog!("                        -> unlinked"),
-                Err(e) => dlog!("                        -> unlink failed: {}", e),
+                Ok(_) => dlog!("Cleanup: unlinked {:?}", gw_path),
+                Err(e) => dlog!("Cleanup: unlink failed ({})", e),
             }
-        } else {
-            dlog!("Gateway file already gone after close (driver cleaned it up)");
         }
 
-        let buf = inner?;
+        let buf = read_outcome?;
         let buffer_str = String::from_utf8_lossy(&buf).to_string();
         let lines: Vec<String> = buffer_str.lines().map(|s| s.to_string()).collect();
         dlog!("Returning {} lines to caller", lines.len());
@@ -330,25 +301,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_work_id() {
-        let id1 = generate_work_id();
+    fn test_generate_work_id_format() {
+        let id = generate_work_id();
+        assert!(id.starts_with("0x"));
+        assert_eq!(id.len(), 9); // "0x" + 7 hex digits
         let id2 = generate_work_id();
-        assert_ne!(id1, id2);
-        assert_eq!(id1.len(), 8);
+        assert_ne!(id, id2);
     }
 
     #[test]
     fn test_gateway_path_file() {
         let fname = PathBuf::from("/tmp/test.txt");
-        let gw = gateway_path(&fname, "12345678").unwrap();
-        assert_eq!(gw, PathBuf::from("/tmp/.fs_command_gateway 12345678"));
+        let gw = gateway_path(&fname, "0x12345ab").unwrap();
+        assert_eq!(gw, PathBuf::from("/tmp/.fs_command_gateway 0x12345ab"));
     }
 
     #[test]
     fn test_gateway_path_dir() {
         let fname = PathBuf::from("/tmp/testdir");
-        let gw = gateway_path(&fname, "12345678").unwrap();
-        assert_eq!(gw, PathBuf::from("/tmp/.fs_command_gateway 12345678"));
+        let gw = gateway_path(&fname, "0x12345ab").unwrap();
+        assert_eq!(gw, PathBuf::from("/tmp/.fs_command_gateway 0x12345ab"));
     }
 
     #[test]
