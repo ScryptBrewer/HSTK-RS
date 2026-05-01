@@ -3773,7 +3773,10 @@ fn handle_perf_top_calls(globals: &Globals, paths: &[PathBuf]) -> Result<i32> {
     vnprint(globals, "Perf top-calls command");
 
     let stats_files_map = create_stats_files(paths, globals.dry_run)?;
-    let stats_files: Vec<PathBuf> = stats_files_map.values().cloned().collect();
+    let stats_files: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|p| stats_files_map.get(p).cloned())
+        .collect();
 
     let eval_args = expression::EvalArgs {
         recursive: false,
@@ -3783,7 +3786,7 @@ fn handle_perf_top_calls(globals: &Globals, paths: &[PathBuf]) -> Result<i32> {
         json: globals.output_json,
     };
 
-    let exp = "{(fs_stats.op_stats-get-tag(\"old_stats\")),TOP100_TABLE{|::KEY={#A[PARENT.ROW].op_count,#A[PARENT.ROW].name,#A[PARENT.ROW].op_count,#A[PARENT.ROW].op_time,#A[PARENT.ROW].op_avg}}[ROWS(#A)]}.#B";
+    let exp = "{(fs_stats.op_stats-get_tag(\"old_stats\")),TOP100_TABLE{|::KEY={#A[PARENT.ROW].op_count,#A[PARENT.ROW].name,#A[PARENT.ROW].op_count,#A[PARENT.ROW].op_time,#A[PARENT.ROW].op_avg}}[ROWS(#A)]}.#B";
 
     let hsexp = HSExp::new(exp.to_string());
     let command = expression::gen_eval(&hsexp, &eval_args)?;
@@ -3793,11 +3796,46 @@ fn handle_perf_top_calls(globals: &Globals, paths: &[PathBuf]) -> Result<i32> {
     Ok(cmd.exit_status)
 }
 
+// ============================================================================
+// FIX: handle_perf_top_ops
+// Change:  op_stats-get-tag   ->   op_stats-get_tag
+// ============================================================================
+fn handle_perf_top_ops(globals: &Globals, paths: &[PathBuf]) -> Result<i32> {
+    vnprint(globals, "Perf top-ops command");
+
+    let stats_files_map = create_stats_files(paths, globals.dry_run)?;
+    let stats_files: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|p| stats_files_map.get(p).cloned())
+        .collect();
+
+    let eval_args = expression::EvalArgs {
+        recursive: false,
+        nonfiles: false,
+        raw: false,
+        compact: false,
+        json: globals.output_json,
+    };
+
+    let exp = "{(fs_stats.op_stats-get_tag(\"old_stats\")),TOP100_TABLE{|::KEY={#A[PARENT.ROW].op_time,#A[PARENT.ROW].name,#A[PARENT.ROW].op_count,#A[PARENT.ROW].op_time,#A[PARENT.ROW].op_avg}}[ROWS(#A)]}.#B";
+
+    let hsexp = HSExp::new(exp.to_string());
+    let command = expression::gen_eval(&hsexp, &eval_args)?;
+
+    let mut cmd = ShadCmd::new(globals.clone());
+    cmd.run(&stats_files, &command)?;
+    Ok(cmd.exit_status)
+}
+
+
 fn handle_perf_top_funcs(globals: &Globals, op: Option<&str>, paths: &[PathBuf]) -> Result<i32> {
     vnprint(globals, &format!("Perf top-funcs command (op: {:?})", op));
 
     let stats_files_map = create_stats_files(paths, globals.dry_run)?;
-    let stats_files: Vec<PathBuf> = stats_files_map.values().cloned().collect();
+    let stats_files: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|p| stats_files_map.get(p).cloned())
+        .collect();
 
     let eval_args = expression::EvalArgs {
         recursive: false,
@@ -3808,7 +3846,10 @@ fn handle_perf_top_funcs(globals: &Globals, op: Option<&str>, paths: &[PathBuf])
     };
 
     let op_filter = op.unwrap_or("all");
-    let exp = format!("{{(FS_STATS.OP_STATS-get-tag(\"old_stats\"))[|NAME=\"{}\"].func_stats,TOP100_TABLE{{|::KEY={{#A[PARENT.ROW].op_time,#A[PARENT.ROW].name,#A[PARENT.ROW].op_count,#A[PARENT.ROW].op_avg}}[ROWS(#A)]}}.#B", op_filter);
+    let exp = format!(
+        "{{(FS_STATS.OP_STATS-get_tag(\"old_stats\"))[|NAME=\"{}\"].func_stats,TOP100_TABLE{{|::KEY={{#A[PARENT.ROW].op_time,#A[PARENT.ROW].name,#A[PARENT.ROW].op_count,#A[PARENT.ROW].op_avg}}}}[ROWS(#A)]}}.#B",
+        op_filter
+    );
 
     let hsexp = HSExp::new(exp);
     let command = expression::gen_eval(&hsexp, &eval_args)?;
@@ -3818,11 +3859,15 @@ fn handle_perf_top_funcs(globals: &Globals, op: Option<&str>, paths: &[PathBuf])
     Ok(cmd.exit_status)
 }
 
-fn handle_perf_top_ops(globals: &Globals, paths: &[PathBuf]) -> Result<i32> {
-    vnprint(globals, "Perf top-ops command");
+
+fn handle_perf_flushes(globals: &Globals, paths: &[PathBuf]) -> Result<i32> {
+    vnprint(globals, "Perf flushes command");
 
     let stats_files_map = create_stats_files(paths, globals.dry_run)?;
-    let stats_files: Vec<PathBuf> = stats_files_map.values().cloned().collect();
+    let stats_files: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|p| stats_files_map.get(p).cloned())
+        .collect();
 
     let eval_args = expression::EvalArgs {
         recursive: false,
@@ -3832,33 +3877,10 @@ fn handle_perf_top_ops(globals: &Globals, paths: &[PathBuf]) -> Result<i32> {
         json: globals.output_json,
     };
 
-    let exp = "{(fs_stats.op_stats-get-tag(\"old_stats\")),TOP100_TABLE{|::KEY={#A[PARENT.ROW].op_time,#A[PARENT.ROW].name,#A[PARENT.ROW].op_count,#A[PARENT.ROW].op_time,#A[PARENT.ROW].op_avg}}[ROWS(#A)]}.#B";
+    let exp = "sum({|::#A=(fs_stats.op_stats-get_tag(\"old_stats\"))[ROW].flush_count}[ROWS(fs_stats.op_stats)])";
 
     let hsexp = HSExp::new(exp.to_string());
     let command = expression::gen_eval(&hsexp, &eval_args)?;
-
-    let mut cmd = ShadCmd::new(globals.clone());
-    cmd.run(&stats_files, &command)?;
-    Ok(cmd.exit_status)
-}
-
-fn handle_perf_flushes(globals: &Globals, paths: &[PathBuf]) -> Result<i32> {
-    vnprint(globals, "Perf flushes command");
-
-    let stats_files_map = create_stats_files(paths, globals.dry_run)?;
-    let stats_files: Vec<PathBuf> = stats_files_map.values().cloned().collect();
-
-    let sum_args = expression::SumArgs {
-        raw: false,
-        compact: false,
-        nonfiles: false,
-        json: globals.output_json,
-    };
-
-    let exp = "sum({|::#A=(fs_stats.op_stats-get-tag(\"old_stats\"))[ROW].flush_count}[ROWS(fs_stats.op_stats)])";
-
-    let hsexp = HSExp::new(exp.to_string());
-    let command = expression::gen_sum(&hsexp, &sum_args)?;
 
     let mut cmd = ShadCmd::new(globals.clone());
     cmd.run(&stats_files, &command)?;
